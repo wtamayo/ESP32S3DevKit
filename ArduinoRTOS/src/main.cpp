@@ -21,11 +21,20 @@
 #include "freertos/semphr.h"
 
 
+#define WRITER  1
+#define READER  1   // WROOM 1
+
+// Default for Espressif ESP32
+#define CAN_TX		GPIO_NUM_4
+#define CAN_RX		GPIO_NUM_5
+#define CAN_SPEED   500
+
+
 /***** FreeRTOS util defines *****/
 #define DELAY1 250
 #define DELAY2 500
 
-#define USING_STATUS_LED    0
+#define USING_STATUS_LED    1
 #define USING_RTOS_TASKS    0
 #define USING_RTOS_MUTEX    0
 // Xiao SPI PIN remapping SCK, MISO, MOSI, SS
@@ -34,8 +43,13 @@
 #define MOSI   GPIO_NUM_10
 #define SS     GPIO_NUM_0
 
-QueueHandle_t queue;
-#define QUEUE_MAX_ITEMS     10      // Max items that the queue can hold  
+// Define 11bit or 29 bit Identifier
+ typedef enum {
+    id11bit,
+    id29bit
+} idfSize_t;
+
+
 byte mac[] = {
   0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED
 };
@@ -51,6 +65,10 @@ char ReplyBuffer[] = "acknowledged";        // a string to send back
 EthernetUDP Udp;
 
 #if USING_RTOS_TASKS
+
+QueueHandle_t queue;
+#define QUEUE_MAX_ITEMS     10      // Max items that the queue can hold  
+
 // Define an enumerated type used to identify the source of the data.
 typedef enum {
   device1 = 1,
@@ -178,6 +196,79 @@ void readChipInfo()
 }
 
 
+void writeCAN(uint32_t CANID, idfSize_t sizeId, uint8_t dataLength, uint64_t payload) {
+	
+    CanFrame txFrame = { 0 };
+	txFrame.identifier = CANID;                // 0x18FF147A => 47A 11bit ID
+	txFrame.extd = sizeId;                     // 0 = 11bit ID, 1 = 29bit ID
+	txFrame.data_length_code = dataLength;     // How many bytes in paylod, max is 8
+
+    if (txFrame.data_length_code > TWAI_FRAME_MAX_DLC)
+        txFrame.data_length_code = TWAI_FRAME_MAX_DLC;
+
+    // Best to use 0xAA (0b10101010) instead of 0
+	// CAN works better this way as it needs
+	// to avoid bit-stuffing	
+    memset(txFrame.data, 0xAA, sizeof(txFrame.data)); 
+  
+    char* pByte;
+    uint8_t index;
+
+    // MSB first
+    for (int i = 0; i < txFrame.data_length_code; i++) {
+        pByte = (char*)&payload + i;
+        index = (txFrame.data_length_code-1)-i;
+        txFrame.data[index] = *pByte;         
+        //Serial.printf("Payload %d:0x%X \n", index, txFrame.data[index]);        
+    }
+
+    /*
+    // LSB first
+    for (int i = 0; i < txFrame.data_length_code; i++) {
+        pByte = (char*)&payload + i;
+        txFrame.data[i] = *pByte;         
+        Serial.printf("Payload %d:0x%X \n", i, txFrame.data[i]);        
+    }
+    */	
+	
+    // Accepts both pointers and references 
+    Serial.printf("> Writting CAN ID: 0x%X  \r\n", txFrame.identifier);
+    Serial.print("   Payload data: ");
+    for (int i=0; i<txFrame.data_length_code; i++) {
+         Serial.printf("%X ", txFrame.data[i]);
+    }  
+
+    // timeout defaults to 1 ms
+    if (ESP32Can.writeFrame(txFrame, 10) == false) {
+        Serial.print(" (Tx <--> Rx error)");
+    }   
+
+    Serial.println("\n");
+}
+
+void readCAN()
+{
+    CanFrame rxFrame;
+
+    // You can set custom timeout, default is 1000
+    if(ESP32Can.readFrame(rxFrame, 1000)) {
+        //uint16_t PNG = (rxFrame.identifier & 0x00FFFF00) >> 8;
+        Serial.printf("< Reading CAN ID: 0x%X \r\n", rxFrame.identifier);
+        
+        Serial.print("   Payload data: ");
+        for (int i=0; i<rxFrame.data_length_code; i++) {
+             Serial.printf("%X ", rxFrame.data[i]);
+        }  
+        Serial.println("\n");
+
+        //Serial.printf("Payload data: 0x%X \r\n", rxFrame.data);
+        //if(rxFrame.identifier == 0x7E8) { 
+            //Serial.printf("Collant temp: %3d°C \r\n", rxFrame.data[3] - 40); 
+        //}
+    }
+}
+
+
 void initSPI()
 {
   Serial.print("MOSI: ");
@@ -191,6 +282,55 @@ void initSPI()
 
   // SPI Pin Reasignment
   //SPI.begin(SCK, MISO, MOSI, SS);
+}
+
+
+void initCAN()
+{
+#if READER and WRITER
+    Serial.println("Device in R/W mode");
+#elif READER
+    Serial.println("Device in Reader mode");
+#elif WRITER    
+    Serial.println("Device in Writer mode");
+#endif
+
+    // Set pins
+  Serial.println("Setting up CAN/TWAI");
+	ESP32Can.setPins(CAN_TX, CAN_RX);
+	
+   
+  // It is also safe to use .begin() without .end() as it calls it internally
+  if (ESP32Can.begin(ESP32Can.convertSpeed(CAN_SPEED), CAN_TX, CAN_RX, 10, 10)) {
+      Serial.println("CAN bus started!");
+  } else {
+      Serial.println("CAN bus failed!");
+  }
+}
+
+void mCAN()
+{
+  static uint32_t lastStamp = 0;
+  uint32_t currentStamp = millis();    
+  static bool write = false;
+
+  // Set 29bit CANID: 18FF147A (max 0x1FFFFFFF) or 11bit CANID: 47A (max 7FF)
+  uint32_t canid = 0x18FF147A; 
+  uint64_t payload = 0xDEADBEEFB5B6B7B8;
+
+  if (currentStamp - lastStamp > 200) { 
+      lastStamp = currentStamp;
+      if (write) {
+#if WRITER
+        writeCAN(canid, id29bit, TWAI_FRAME_MAX_DLC, payload);
+#endif                        
+      } else {
+#if READER            
+        readCAN();
+#endif            
+      }
+        write = !write; 
+    }
 }
 
 
@@ -250,7 +390,6 @@ void mEthernet()
     Udp.endPacket();
   }
 }
-
 
 
 /****** Real Time Application Tasks ******/
@@ -430,10 +569,11 @@ void setup()
   Serial.println("Setup started.");
 
   readChipInfo();
+  initCAN();
   
-  Serial.println("Setting up Ethernet on Xiao");
-  initSPI();
+  //initSPI();
   //initEth();
+
 
   // On Board LED heatbeat
 #if USING_STATUS_LED
@@ -446,8 +586,8 @@ void setup()
   //SerialRS232.onReceive(); TODO: set onRecive callback so no need to add in the polling loop)
   
  // Connect to WiFi network
-  initWifiAP();
-  initWiFiServer();
+ //initWifiAP();
+ //initWiFiServer();
 
 
 #if USING_RTOS_MUTEX
@@ -481,8 +621,8 @@ void loop() {
   WiFiClient client = server.available();
 
   if (client.connected()) {
-    WiFi_WebApp.process(&client);
-    client.stop();
+      WiFi_WebApp.process(&client);
+      client.stop();
   }
 
   if (shouldRestart) {
@@ -496,9 +636,10 @@ void loop() {
   digitalWrite(onBoardLED, LOW);
   delay(1000);
 #endif  
-  
+
+  mCAN();  
   //mSPI();
-  mEthernet();
+  //mEthernet();
 
   
 }
